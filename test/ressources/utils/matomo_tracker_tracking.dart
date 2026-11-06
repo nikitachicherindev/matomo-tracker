@@ -3,6 +3,7 @@ import 'package:matomo_tracker/matomo_tracker.dart';
 import 'package:meta/meta.dart';
 
 import 'get_initialized_mamoto_tracker.dart';
+import 'queued_actions.dart';
 
 /// Used to test [MatomoTracker] tracking logic.
 @isTest
@@ -13,10 +14,10 @@ void testTracking(
 }) {
   test(description, () async {
     final matomoTracker = await getInitializedMatomoTracker();
-    final queueLength = matomoTracker.queue.length;
+    final queueLength = (await queuedActions(matomoTracker)).length;
     trackFunction(matomoTracker);
 
-    expect(matomoTracker.queue.length, queueLength + 1);
+    expect(await queuedActions(matomoTracker), hasLength(queueLength + 1));
 
     extraExpectations?.call(matomoTracker);
   });

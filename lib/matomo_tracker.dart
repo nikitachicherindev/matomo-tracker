@@ -2,6 +2,7 @@
 /// for Flutter.
 library;
 
+export 'src/action_store/action_store.dart';
 export 'src/campaign.dart';
 export 'src/content.dart';
 export 'src/dispatch_settings.dart';

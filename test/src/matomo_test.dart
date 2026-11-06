@@ -1,4 +1,7 @@
+import 'dart:convert';
+
 import 'package:flutter_test/flutter_test.dart';
+import 'package:matomo_tracker/src/action_store/memory_action_store.dart';
 import 'package:matomo_tracker/src/content.dart';
 import 'package:matomo_tracker/src/dispatch_settings.dart';
 import 'package:matomo_tracker/src/event_info.dart';
@@ -13,6 +16,7 @@ import '../ressources/utils/matomo_tracker_initialization.dart';
 import '../ressources/utils/matomo_tracker_setup.dart';
 import '../ressources/utils/matomo_tracker_tracking.dart';
 import '../ressources/utils/mock_platform_info.dart';
+import '../ressources/utils/queued_actions.dart';
 import '../ressources/utils/uninitialized_test_util.dart';
 
 void main() {
@@ -82,37 +86,37 @@ void main() {
         () async {
       final matomoTracker = await getInitializedMatomoTracker();
       matomoTracker.trackDimensions(dimensions: matomoTrackerDimensions);
-      expect(matomoTracker.queue, isNotEmpty);
+      expect(await queuedActions(matomoTracker), isNotEmpty);
 
       await matomoTracker.setOptOut(optOut: true);
       matomoTracker.trackDimensions(dimensions: matomoTrackerDimensions);
-      expect(matomoTracker.queue, isEmpty);
+      expect(await queuedActions(matomoTracker), isEmpty);
 
       await matomoTracker.setOptOut(optOut: false);
       matomoTracker.trackDimensions(dimensions: matomoTrackerDimensions);
-      expect(matomoTracker.queue, hasLength(1));
+      expect(await queuedActions(matomoTracker), hasLength(1));
     });
 
     test('it should drop restored actions if opted out at initialization',
         () async {
       when(mockLocalStorage.getOptOut).thenAnswer((_) async => true);
-      when(mockLocalStorage.loadActions)
-          .thenAnswer((_) async => '[{"action_name":"stored"}]');
-      when(() => mockLocalStorage.storeActions(any())).thenAnswer((_) async {});
+      final store = MemoryActionStore();
+      await store.add('{"action_name":"stored"}');
       final matomoTracker = MatomoTracker();
       await matomoTracker.initialize(
         siteId: matomoTrackerSiteId,
         url: matomoTrackerUrl,
         localStorage: mockLocalStorage,
         packageInfo: mockPackageInfo,
+        actionStore: store,
         dispatchSettings: const DispatchSettings.persistent(
           onLoad: DispatchSettings.takeAll,
         ),
       );
 
-      expect(matomoTracker.queue, isEmpty);
+      expect(await queuedActions(matomoTracker), isEmpty);
       matomoTracker.trackDimensions(dimensions: matomoTrackerDimensions);
-      expect(matomoTracker.queue, isEmpty);
+      expect(await queuedActions(matomoTracker), isEmpty);
     });
 
     test('it should be able to get optOut from local db', () async {
@@ -151,7 +155,7 @@ void main() {
 
     test('it should be able to clear localData', () async {
       final matomoTracker = await getInitializedMatomoTracker();
-      matomoTracker.clear();
+      await matomoTracker.clear();
 
       verify(mockLocalStorage.clear);
     });
@@ -159,22 +163,22 @@ void main() {
 
   test('it should be able to dispatchActions', () async {
     final matomoTracker = await getInitializedMatomoTracker();
-    final queueLength = matomoTracker.queue.length;
+    final queueLength = (await queuedActions(matomoTracker)).length;
 
     matomoTracker.trackDimensions(dimensions: matomoTrackerDimensions);
-    expect(matomoTracker.queue.length, queueLength + 1);
+    expect(await queuedActions(matomoTracker), hasLength(queueLength + 1));
     await matomoTracker.dispatchActions();
-    expect(matomoTracker.queue.length, 0);
+    expect(await queuedActions(matomoTracker), isEmpty);
   });
 
   test('it should be able to dropActions', () async {
     final matomoTracker = await getInitializedMatomoTracker();
-    final queueLength = matomoTracker.queue.length;
+    final queueLength = (await queuedActions(matomoTracker)).length;
 
     matomoTracker.trackDimensions(dimensions: matomoTrackerDimensions);
-    expect(matomoTracker.queue.length, queueLength + 1);
-    matomoTracker.dropActions();
-    expect(matomoTracker.queue.length, 0);
+    expect(await queuedActions(matomoTracker), hasLength(queueLength + 1));
+    await matomoTracker.dropActions();
+    expect(await queuedActions(matomoTracker), isEmpty);
   });
 
   group('tracking', () {
@@ -280,9 +284,12 @@ void main() {
       final matomoTracker = await getInitializedMatomoTracker();
 
       matomoTracker.trackDimensions(dimensions: matomoTrackerDimensions);
-      expect(matomoTracker.queue.first['new_visit'], '1');
+      expect((await queuedActions(matomoTracker)).first['new_visit'], '1');
       matomoTracker.trackDimensions(dimensions: matomoTrackerDimensions);
-      expect(matomoTracker.queue.last.containsKey('new_visit'), false);
+      expect(
+        (await queuedActions(matomoTracker)).last.containsKey('new_visit'),
+        false,
+      );
     });
   });
 
@@ -546,5 +553,148 @@ void main() {
     for (final MapEntry(key: name, value: call) in calls.entries) {
       group(name, () => uninitializedTest(call));
     }
+  });
+
+  group('dispatchActions', () {
+    late MockHttpClient httpClient;
+    late MockHttpResponse response;
+
+    setUp(() {
+      registerFallbackValue(Uri());
+      httpClient = MockHttpClient();
+      response = MockHttpResponse();
+      when(
+        () => httpClient.post(
+          any(),
+          headers: any(named: 'headers'),
+          body: any(named: 'body'),
+        ),
+      ).thenAnswer((_) async => response);
+    });
+
+    Future<MatomoTracker> trackerWith150Actions() async {
+      final tracker = await getInitializedMatomoTracker(httpClient: httpClient);
+      for (var i = 0; i < 150; i++) {
+        tracker.trackDimensions(dimensions: matomoTrackerDimensions);
+      }
+      return tracker;
+    }
+
+    test('it should send in batches and remove what was sent', () async {
+      when(() => response.statusCode).thenReturn(200);
+      final tracker = await trackerWith150Actions();
+
+      await tracker.dispatchActions();
+
+      final bodies = verify(
+        () => httpClient.post(
+          any(),
+          headers: any(named: 'headers'),
+          body: captureAny(named: 'body'),
+        ),
+      ).captured;
+      expect(
+        [
+          for (final body in bodies)
+            (jsonDecode(body as String) as Map)['requests'].length
+        ],
+        [100, 50],
+      );
+      expect(await queuedActions(tracker), isEmpty);
+    });
+
+    test('it should stop at the first failed batch and keep it', () async {
+      when(() => response.statusCode).thenReturn(503);
+      final tracker = await trackerWith150Actions();
+
+      await tracker.dispatchActions();
+
+      verify(
+        () => httpClient.post(
+          any(),
+          headers: any(named: 'headers'),
+          body: any(named: 'body'),
+        ),
+      ).called(1);
+      expect(await queuedActions(tracker), hasLength(150));
+    });
+
+    test('it should drop unreadable stored actions at initialization',
+        () async {
+      when(() => response.statusCode).thenReturn(503);
+      final store = MemoryActionStore();
+      final recent = DateTime.now().toUtc().toIso8601String();
+      for (final action in [
+        'not json',
+        '{"n":1}',
+        '{"cdt":"not a date"}',
+        jsonEncode({'cdt': recent}),
+      ]) {
+        await store.add(action);
+      }
+
+      final tracker = MatomoTracker();
+      await tracker.initialize(
+        siteId: matomoTrackerSiteId,
+        url: matomoTrackerUrl,
+        localStorage: mockLocalStorage,
+        packageInfo: mockPackageInfo,
+        httpClient: httpClient,
+        actionStore: store,
+        dispatchSettings: const DispatchSettings.persistent(),
+      );
+
+      expect(await queuedActions(tracker), [
+        {'cdt': recent},
+      ]);
+    });
+
+    test('it should send the readable actions and drop the others', () async {
+      when(() => response.statusCode).thenReturn(200);
+      final store = MemoryActionStore();
+      final tracker = await getInitializedMatomoTracker(
+        httpClient: httpClient,
+        actionStore: store,
+      );
+      await store.add('not json');
+      tracker.trackDimensions(dimensions: matomoTrackerDimensions);
+
+      await tracker.dispatchActions();
+
+      final body = verify(
+        () => httpClient.post(
+          any(),
+          headers: any(named: 'headers'),
+          body: captureAny(named: 'body'),
+        ),
+      ).captured.single as String;
+      expect((jsonDecode(body) as Map)['requests'], hasLength(1));
+      expect(await store.maxId(), isNull);
+    });
+
+    test('it should drop stored actions rejected by onLoad', () async {
+      when(() => response.statusCode).thenReturn(503);
+      final store = MemoryActionStore();
+      final now = DateTime.now().toUtc();
+      for (final date in [now.subtract(const Duration(days: 2)), now]) {
+        await store.add(jsonEncode({'cdt': date.toIso8601String()}));
+      }
+
+      final tracker = MatomoTracker();
+      await tracker.initialize(
+        siteId: matomoTrackerSiteId,
+        url: matomoTrackerUrl,
+        localStorage: mockLocalStorage,
+        packageInfo: mockPackageInfo,
+        httpClient: httpClient,
+        actionStore: store,
+        dispatchSettings: const DispatchSettings.persistent(),
+      );
+
+      expect(
+        (await queuedActions(tracker)).single['cdt'],
+        now.toIso8601String(),
+      );
+    });
   });
 }

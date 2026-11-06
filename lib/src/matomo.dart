@@ -1,10 +1,13 @@
 import 'dart:async';
-import 'dart:collection';
+import 'dart:convert';
 
 import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+import 'package:matomo_tracker/src/action_store/action_store.dart';
+import 'package:matomo_tracker/src/action_store/memory_action_store.dart';
+import 'package:matomo_tracker/src/action_store/shared_prefs_action_store.dart';
 import 'package:matomo_tracker/src/assert.dart';
 import 'package:matomo_tracker/src/campaign.dart';
 import 'package:matomo_tracker/src/content.dart';
@@ -19,7 +22,6 @@ import 'package:matomo_tracker/src/logger/logger.dart';
 import 'package:matomo_tracker/src/matomo_action.dart';
 import 'package:matomo_tracker/src/matomo_dispatcher.dart';
 import 'package:matomo_tracker/src/performance_info.dart';
-import 'package:matomo_tracker/src/persistent_queue.dart';
 import 'package:matomo_tracker/src/platform_info/platform_info.dart';
 import 'package:matomo_tracker/src/tracking_order_item.dart';
 import 'package:matomo_tracker/src/visitor.dart';
@@ -148,7 +150,7 @@ class MatomoTracker {
   /// actions that are still in the queue.
   Future<void> setOptOut({required bool optOut}) async {
     _optOut = optOut;
-    if (optOut) dropActions();
+    if (optOut) await dropActions();
     await _localStorage.setOptOut(optOut: optOut);
   }
 
@@ -181,7 +183,10 @@ class MatomoTracker {
   late LocalStorage _localStorage;
 
   @visibleForTesting
-  late final Queue<Map<String, String>> queue;
+  ActionStore get actionStore => _actionStore;
+  late final ActionStore _actionStore;
+
+  static const _dispatchBatchSize = 100;
 
   @visibleForTesting
   late Timer dequeueTimer;
@@ -228,6 +233,11 @@ class MatomoTracker {
   /// used. This means that the first_visit and the user_id will be stored in
   /// memory and will be lost when the app is closed.
   ///
+  /// The [actionStore] keeps the actions waiting to be dispatched. Pass your
+  /// own to keep them in your database. By default, it is persisted in
+  /// shared preferences if [dispatchSettings] is persistent, and kept in
+  /// memory otherwise.
+  ///
   /// The [pingInterval] is used to set the interval in which pings are
   /// send to Matomo to circumvent the [last page viewtime issue](https://github.com/Floating-Dartists/matomo-tracker/issues/78).
   /// To deactivate pings, set this to `null`. The default value is a good
@@ -247,6 +257,7 @@ class MatomoTracker {
     String? tokenAuth,
     http.Client? httpClient,
     LocalStorage? localStorage,
+    ActionStore? actionStore,
     PackageInfo? packageInfo,
     PlatformInfo? platformInfo,
     bool cookieless = false,
@@ -293,13 +304,13 @@ class MatomoTracker {
 
     _setLocalStorage(localStorage);
 
-    final onLoad = _dispatchSettings.onLoad;
-    queue = _dispatchSettings.persistentQueue && onLoad != null
-        ? await PersistentQueue.load(
-            storage: _localStorage,
-            onLoadFilter: onLoad,
-          )
-        : Queue();
+    _actionStore = actionStore ??
+        (_dispatchSettings.persistentQueue
+            ? SharedPrefsActionStore()
+            : MemoryActionStore());
+    if (_dispatchSettings.onLoad case final onLoad?) {
+      await _filterStoredActions(onLoad);
+    }
 
     final localVisitorId = visitorId ?? await _getVisitorId();
     _visitor = Visitor(id: localVisitorId, uid: uid);
@@ -337,7 +348,7 @@ class MatomoTracker {
 
     _optOut = (await _localStorage.getOptOut()) ?? optOut;
     unawaited(_localStorage.setOptOut(optOut: _optOut));
-    if (_optOut) dropActions();
+    if (_optOut) await dropActions();
 
     log.fine(
       'Matomo Initialized: visitorId=$localVisitorId; contentBase=$contentBase; resolution=${screenResolution.width}x${screenResolution.height}; userAgent=${this.userAgent}',
@@ -354,7 +365,7 @@ class MatomoTracker {
       });
     }
 
-    if (queue.isNotEmpty) {
+    if (await _actionStore.maxId() != null) {
       unawaited(dispatchActions());
     }
   }
@@ -411,7 +422,12 @@ class MatomoTracker {
   }
 
   /// {@macro local_storage.clear}
-  void clear() => _localStorage.clear();
+  ///
+  /// Also drops all actions queued for dispatching.
+  Future<void> clear() async {
+    await _localStorage.clear();
+    await _actionStore.clear();
+  }
 
   /// Cancel the timer which checks the queued actions to send
   ///
@@ -453,9 +469,7 @@ class MatomoTracker {
   }
 
   /// Drops all actions queued for dispatching.
-  void dropActions() {
-    queue.clear();
-  }
+  Future<void> dropActions() => _actionStore.clear();
 
   /// This will register a page view with [trackPageViewWithName] by using the
   /// `context.widget.toStringShort()` as `actionName` value.
@@ -923,7 +937,54 @@ class MatomoTracker {
 
   void _track(MatomoAction action) {
     if (_optOut) return;
-    queue.add(action.toMap(this));
+    unawaited(
+      _actionStore.add(jsonEncode(action.toMap(this))).catchError(
+            (Object e, StackTrace s) => log.severe(
+                message: 'Could not store action', error: e, stackTrace: s),
+          ),
+    );
+  }
+
+  /// Returns `null` for an action that cannot be read.
+  static Map<String, String>? _decodeAction(String action) {
+    try {
+      final decoded = jsonDecode(action);
+      if (decoded is! Map ||
+          !decoded.values.every((value) => value is String)) {
+        return null;
+      }
+      return Map<String, String>.from(decoded);
+    } on FormatException {
+      return null;
+    }
+  }
+
+  /// Removes the stored actions that cannot be read or that [keep] rejects.
+  Future<void> _filterStoredActions(PersistenceFilter keep) async {
+    bool isKept(String action) {
+      final decoded = _decodeAction(action);
+      if (decoded == null) return false;
+      try {
+        return keep(decoded);
+      } on FormatException {
+        // e.g. a `cdt` that cannot be parsed: drop it instead of failing.
+        return false;
+      }
+    }
+
+    final ids = <int>[];
+    var batch = await _actionStore.read(afterId: 0, limit: _dispatchBatchSize);
+    while (batch.isNotEmpty) {
+      ids.addAll([
+        for (final (:id, :action) in batch)
+          if (!isKept(action)) id,
+      ]);
+      batch = await _actionStore.read(
+        afterId: batch.last.id,
+        limit: _dispatchBatchSize,
+      );
+    }
+    if (ids.isNotEmpty) await _actionStore.remove(ids);
   }
 
   void _ping() {
@@ -943,21 +1004,31 @@ class MatomoTracker {
       throw const UninitializedMatomoInstanceException();
     }
 
-    log.finest('Processing queue ${queue.length}');
-
     if (!_lock.locked) {
       return _lock.synchronized(() async {
-        final actions = List<Map<String, String>>.of(queue);
-        if (!_optOut) {
+        if (_optOut) return;
+        // Bounded, so actions tracked meanwhile cannot keep the cycle running.
+        final maxId = await _actionStore.maxId();
+        log.finest('Processing queue up to id $maxId');
+        var lastId = 0;
+        while (maxId != null && lastId < maxId) {
+          final batch = await _actionStore.read(
+            afterId: lastId,
+            limit: _dispatchBatchSize,
+          );
+          if (batch.isEmpty) break;
+          lastId = batch.last.id;
+
           final hasSucceeded = await _dispatcher.sendBatch(
-            actions: actions,
+            // Unreadable actions are left out, and removed with the batch.
+            actions: [
+              for (final (:action, id: _) in batch) _decodeAction(action),
+            ].nonNulls.toList(),
             customHeaders: customHeaders,
           );
-          if (hasSucceeded) {
-            // As the operation is asynchronous we need to be sure to remove
-            // only the actions that were sent in the batch.
-            queue.removeWhere(actions.contains);
-          }
+          // A failure is transient, so the next batches would fail too.
+          if (!hasSucceeded) break;
+          await _actionStore.remove([for (final (:id, action: _) in batch) id]);
         }
       });
     }

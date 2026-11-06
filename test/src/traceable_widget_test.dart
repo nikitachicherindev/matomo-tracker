@@ -4,6 +4,7 @@ import 'package:matomo_tracker/matomo_tracker.dart';
 
 import '../ressources/utils/get_initialized_mamoto_tracker.dart';
 import '../ressources/utils/matomo_tracker_setup.dart';
+import '../ressources/utils/queued_actions.dart';
 import '../ressources/utils/testable_app.dart';
 
 void main() {
@@ -16,7 +17,7 @@ void main() {
   });
 
   testWidgets('it should be able to track widget', (tester) async {
-    final queueLength = matomoTracker.queue.length;
+    final queueLength = (await queuedActions(matomoTracker)).length;
 
     await tester.pumpWidget(
       const TestableApp(
@@ -30,6 +31,6 @@ void main() {
     final traceableWidgetFinder = find.byType(TraceableWidget);
 
     expect(traceableWidgetFinder, findsOneWidget);
-    expect(matomoTracker.queue.length, queueLength + 1);
+    expect(await queuedActions(matomoTracker), hasLength(queueLength + 1));
   });
 }
