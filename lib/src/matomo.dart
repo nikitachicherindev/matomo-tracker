@@ -56,7 +56,23 @@ class MatomoTracker {
   /// The ID of the website we're tracking a visit/action for.
   ///
   /// Corresponds with `idsite`.
-  late final String siteId;
+  ///
+  /// You can use [setSiteId] to change this value after initialization.
+  String get siteId => _siteId;
+  late String _siteId;
+
+  /// Sets the ID of the website used by the actions tracked from now on.
+  ///
+  /// Actions that are still in the queue keep the site ID they were tracked
+  /// with.
+  void setSiteId(String newSiteId) {
+    _initializationCheck();
+
+    _siteId = newSiteId;
+    // Its pv_id and path belong to the old site, so pings and
+    // attachLastScreenInfo must not reuse them.
+    _lastPageView = null;
+  }
 
   /// The url of the Matomo endpoint.
   ///
@@ -290,7 +306,7 @@ class MatomoTracker {
 
     log.setLogging(level: verbosityLevel);
 
-    this.siteId = siteId;
+    _siteId = siteId;
     _url = url;
     this.customHeaders = customHeaders;
     _pingInterval = pingInterval;

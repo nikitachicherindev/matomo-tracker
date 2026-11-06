@@ -697,4 +697,38 @@ void main() {
       );
     });
   });
+
+  group('setSiteId', () {
+    test('should throw if not initialized', () {
+      expect(
+        () => MatomoTracker().setSiteId(''),
+        throwsA(isA<UninitializedMatomoInstanceException>()),
+      );
+    });
+
+    test(
+      'should use the new siteId for new actions only and drop the last page view',
+      () async {
+        const newSiteId = '2';
+        final tracker = await getInitializedMatomoTracker();
+
+        tracker.trackPageViewWithName(
+          actionName: matomoTrackerMockWidget.toStringShort(),
+        );
+        tracker.setSiteId(newSiteId);
+        tracker.trackEvent(
+          eventInfo: EventInfo(
+            category: matomoTrackerEventCategory,
+            action: matomoTrackerAction,
+          ),
+        );
+
+        final actions = await queuedActions(tracker);
+        expect(tracker.siteId, newSiteId);
+        expect(actions.first['idsite'], matomoTrackerSiteId);
+        expect(actions.last['idsite'], newSiteId);
+        expect(actions.last.containsKey('pv_id'), isFalse);
+      },
+    );
+  });
 }
