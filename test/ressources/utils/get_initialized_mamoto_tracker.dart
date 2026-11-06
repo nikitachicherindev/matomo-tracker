@@ -1,3 +1,4 @@
+import 'package:http/http.dart' as http;
 import 'package:matomo_tracker/matomo_tracker.dart';
 import 'package:matomo_tracker/src/platform_info/platform_info.dart';
 
@@ -18,6 +19,8 @@ Future<MatomoTracker> getInitializedMatomoTracker({
   PlatformInfo? platformInfo,
   bool shouldForceCreation = true,
   bool cookieless = false,
+  http.Client? httpClient,
+  ActionStore? actionStore,
 }) async {
   final matomoTracker =
       shouldForceCreation ? MatomoTracker() : MatomoTracker.instance;
@@ -36,6 +39,8 @@ Future<MatomoTracker> getInitializedMatomoTracker({
     tokenAuth: tokenAuth,
     platformInfo: platformInfo,
     cookieless: cookieless,
+    httpClient: httpClient,
+    actionStore: actionStore,
   );
 
   return matomoTracker;

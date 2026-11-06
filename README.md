@@ -247,6 +247,8 @@ await MatomoTracker.instance.initialize(
 );
 ```
 
+The persistent queue is kept in shared preferences. To keep it in your own database instead, implement `ActionStore` (one row per action, with an auto-increment id) and pass it as `actionStore` to `initialize()`. Actions are sent in batches of up to 100.
+
 # Migration Guide
 
 ## v6.0.0

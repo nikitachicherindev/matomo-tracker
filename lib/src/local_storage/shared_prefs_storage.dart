@@ -5,7 +5,6 @@ import 'package:shared_preferences/shared_preferences.dart';
 class SharedPrefsStorage implements LocalStorage {
   static const kVisitorId = 'matomo_visitor_id';
   static const kOptOut = 'matomo_opt_out';
-  static const kPersistentQueue = 'matomo_persistent_queue';
 
   SharedPreferences? _prefs;
 
@@ -43,21 +42,6 @@ class SharedPrefsStorage implements LocalStorage {
   @override
   Future<void> clear() async {
     final prefs = await _getSharedPrefs();
-    await Future.wait([
-      prefs.remove(kVisitorId),
-      prefs.remove(kPersistentQueue),
-    ]);
-  }
-
-  @override
-  Future<String?> loadActions() async {
-    final prefs = await _getSharedPrefs();
-    return prefs.getString(kPersistentQueue);
-  }
-
-  @override
-  Future<void> storeActions(String serializedActions) async {
-    final prefs = await _getSharedPrefs();
-    await prefs.setString(kPersistentQueue, serializedActions);
+    await prefs.remove(kVisitorId);
   }
 }
